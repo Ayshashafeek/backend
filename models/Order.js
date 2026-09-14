@@ -35,6 +35,22 @@ const orderSchema = new mongoose.Schema(
       ],
       default: "Order Placed",
     },
+    trackingNumber: {
+      type: String,
+      trim: true,
+      default: "",
+    },
+    courier: {
+      type: String,
+      trim: true,
+      default: "",
+    },
+    referralId: { type: mongoose.Schema.Types.ObjectId, ref: "Referral", default: null },
+    referralDiscount: { type: Number, default: 0, min: 0 },
+    originalAmount: { type: Number, default: 0, min: 0 },
+    couponCode: { type: String, default: "", uppercase: true, trim: true },
+    couponDiscount: { type: Number, default: 0, min: 0 },
+    deliveredAt: { type: Date, default: null },
   },
   { timestamps: true }
 );

@@ -1,8 +1,9 @@
 const jwt = require("jsonwebtoken");
 const User = require("../models/User");
+const { registerReferral } = require("./referralController");
 
-const generateToken = (id) => {
-  return jwt.sign({ id }, process.env.JWT_SECRET, {
+const generateToken = (user) => {
+  return jwt.sign({ id: user._id, tokenVersion: user.tokenVersion }, process.env.JWT_SECRET, {
     expiresIn: process.env.JWT_EXPIRES_IN || "7d",
   });
 };
@@ -13,25 +14,31 @@ const generateToken = (id) => {
 // through a separate protected endpoint — not covered by this route.
 const registerUser = async (req, res, next) => {
   try {
-    const { name, email, password } = req.body;
+    const { name, email, password, phone, address, referralCode } = req.body;
 
     if (!name || !email || !password) {
       return res.status(400).json({ message: "Name, email, and password are required" });
     }
 
-    const userExists = await User.findOne({ email });
+    const normalizedEmail = typeof email === "string" ? email.toLowerCase().trim() : "";
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail)) {
+      return res.status(400).json({ message: "Please provide a valid email address" });
+    }
+    const userExists = await User.findOne({ email: normalizedEmail });
     if (userExists) {
+      if (referralCode) await registerReferral({ referralCode, email: normalizedEmail, phone, address, referredId: userExists._id });
       return res.status(400).json({ message: "User already exists" });
     }
 
-    const user = await User.create({ name, email, password, role: "customer" });
+    const user = await User.create({ name, email: normalizedEmail, password, phone: phone || "", address: address || {}, role: "customer" });
+    await registerReferral({ referralCode, email: normalizedEmail, phone, address, referredId: user._id });
 
     res.status(201).json({
       _id: user._id,
       name: user.name,
       email: user.email,
       role: user.role,
-      token: generateToken(user._id),
+      token: generateToken(user),
     });
   } catch (err) {
     next(err);
@@ -69,7 +76,7 @@ const loginUser = async (req, res, next) => {
       email: user.email,
       username: user.username,
       role: user.role,
-      token: generateToken(user._id),
+      token: generateToken(user),
     });
   } catch (err) {
     next(err);
@@ -85,4 +92,14 @@ const getMe = async (req, res, next) => {
   }
 };
 
-module.exports = { registerUser, loginUser, getMe };
+// @route  POST /api/auth/logout
+const logoutUser = async (req, res, next) => {
+  try {
+    await User.findByIdAndUpdate(req.user._id, { $inc: { tokenVersion: 1 } });
+    res.json({ message: "Logged out successfully" });
+  } catch (err) {
+    next(err);
+  }
+};
+
+module.exports = { registerUser, loginUser, getMe, logoutUser };

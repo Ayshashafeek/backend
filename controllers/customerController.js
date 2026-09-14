@@ -74,6 +74,7 @@ const updateProfile = async (req, res, next) => {
 // @access  Private (Customer only)
 const logout = async (req, res, next) => {
   try {
+    await User.findByIdAndUpdate(req.user._id, { $inc: { tokenVersion: 1 } });
     res.json({ message: "Logged out successfully" });
   } catch (err) {
     next(err);

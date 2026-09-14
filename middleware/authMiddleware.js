@@ -19,6 +19,9 @@ const protect = async (req, res, next) => {
       if (!req.user.isActive) {
         return res.status(401).json({ message: "Not authorized, account has been deactivated" });
       }
+      if (decoded.tokenVersion !== req.user.tokenVersion) {
+        return res.status(401).json({ message: "Not authorized, token has been revoked" });
+      }
 
       return next();
     } catch (err) {

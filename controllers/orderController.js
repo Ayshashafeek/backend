@@ -5,6 +5,9 @@ const Cart = require("../models/Cart");
 const CartItem = require("../models/CartItem");
 const Product = require("../models/Product");
 const User = require("../models/User");
+const Referral = require("../models/Referral");
+const { getSettings } = require("./referralController");
+const Coupon = require("../models/Coupon");
 
 // @route   POST /api/orders
 // @desc    Checkout customer's cart and create order
@@ -12,6 +15,9 @@ const User = require("../models/User");
 const createOrder = async (req, res, next) => {
   let session = null;
   let useTransaction = false;
+  let createdOrderId = null;
+  const deductedItems = [];
+  let couponReserved = false;
 
   try {
     // 1. Fetch authenticated user
@@ -47,11 +53,18 @@ const createOrder = async (req, res, next) => {
       });
     }
 
-    const phone = (req.body.phone || user.phone || "").trim();
+    const phone = String(req.body.phone || user.phone || "").trim();
+    if (!phone) {
+      return res.status(400).json({ message: "Phone number is required for checkout" });
+    }
 
     // 5. Re-fetch and strictly validate every product before making any DB mutations
     const validatedItems = [];
     let totalAmount = 0;
+    let referral = null;
+    let referralDiscount = 0;
+    let couponCode = "";
+    let couponDiscount = 0;
 
     for (const item of cartItems) {
       const product = await Product.findById(item.productId);
@@ -82,6 +95,35 @@ const createOrder = async (req, res, next) => {
       });
     }
 
+    const originalAmount = totalAmount;
+    if (req.body.couponCode) {
+      couponCode = String(req.body.couponCode).trim().toUpperCase();
+      const coupon = await Coupon.findOne({ code: couponCode, isActive: true });
+      const now = new Date();
+      if (!coupon || now < coupon.validFrom || (coupon.validUntil && now > coupon.validUntil) || (coupon.usageLimit !== null && coupon.usedCount >= coupon.usageLimit) || totalAmount < coupon.minOrderAmount) {
+        return res.status(400).json({ message: "Coupon is invalid, expired, exhausted, or does not meet the order minimum" });
+      }
+      couponDiscount = coupon.discountType === "percentage" ? totalAmount * coupon.discountValue / 100 : coupon.discountValue;
+      if (coupon.maxDiscount !== null) couponDiscount = Math.min(couponDiscount, coupon.maxDiscount);
+      couponDiscount = Math.min(Math.round(couponDiscount * 100) / 100, totalAmount);
+      totalAmount -= couponDiscount;
+      // Reserve the coupon at order creation; failed checkout rollback below restores it.
+      const reservedCoupon = await Coupon.findOneAndUpdate(
+        { _id: coupon._id, $or: [{ usageLimit: null }, { $expr: { $lt: ["$usedCount", "$usageLimit"] } }] },
+        { $inc: { usedCount: 1 } }, { new: true }
+      );
+      if (!reservedCoupon) return res.status(400).json({ message: "Coupon usage limit reached" });
+      couponReserved = true;
+    }
+    const hasPreviousOrder = await Order.exists({ userId: user._id, orderStatus: { $ne: "Cancelled" } });
+    referral = await Referral.findOne({ referredId: user._id, status: "Pending", firstOrderId: null });
+    const referralSettings = await getSettings();
+    if (referral && !hasPreviousOrder && referralSettings.enabled && totalAmount >= referralSettings.minimumOrderAmount) {
+      referralDiscount = referralSettings.refereeDiscountType === "percentage" ? Math.round(totalAmount * referralSettings.refereeDiscountValue) / 100 : referralSettings.refereeDiscountValue;
+      referralDiscount = Math.min(referralDiscount, totalAmount);
+      totalAmount -= referralDiscount;
+    } else referral = null;
+
     // 6. Check if the MongoDB deployment supports multi-document transactions (replica set / sharded cluster like Atlas)
     const topologyType = mongoose.connection.client?.topology?.description?.type;
     const supportsTransactions =
@@ -105,6 +147,11 @@ const createOrder = async (req, res, next) => {
             totalAmount,
             shippingAddress,
             phone,
+            referralId: referral?._id || null,
+            referralDiscount,
+            originalAmount,
+            couponCode,
+            couponDiscount,
             orderStatus: "Order Placed", // Default initial status
           },
         ],
@@ -117,8 +164,19 @@ const createOrder = async (req, res, next) => {
         totalAmount,
         shippingAddress,
         phone,
+        referralId: referral?._id || null,
+        referralDiscount,
+        originalAmount,
+        couponCode,
+        couponDiscount,
         orderStatus: "Order Placed",
       });
+    }
+    createdOrderId = order._id;
+    if (referral) {
+      referral.firstOrderId = order._id;
+      referral.refereeDiscountAmount = referralDiscount;
+      await referral.save(sessionOption);
     }
 
     // 8. Create OrderItem documents (snapshot of product info and price at checkout time)
@@ -134,11 +192,20 @@ const createOrder = async (req, res, next) => {
 
     // 9. Deduct stock for each product
     for (const v of validatedItems) {
-      v.product.stock -= v.quantity;
       if (useTransaction) {
+        v.product.stock -= v.quantity;
         await v.product.save({ session });
       } else {
-        await v.product.save();
+        // Conditional update prevents concurrent checkouts from overselling stock.
+        const updated = await Product.findOneAndUpdate(
+          { _id: v.product._id, stock: { $gte: v.quantity }, available: true },
+          { $inc: { stock: -v.quantity } },
+          { new: true }
+        );
+        if (!updated) {
+          throw new Error(`Insufficient stock for product "${v.productName}" during checkout`);
+        }
+        deductedItems.push(v);
       }
     }
 
@@ -162,6 +229,11 @@ const createOrder = async (req, res, next) => {
         _id: order._id,
         userId: order.userId,
         totalAmount: order.totalAmount,
+        originalAmount: order.originalAmount || order.totalAmount,
+        couponCode: order.couponCode,
+        couponDiscount: order.couponDiscount,
+        referralDiscount: order.referralDiscount,
+        deliveredAt: order.deliveredAt,
         shippingAddress: order.shippingAddress,
         phone: order.phone,
         orderStatus: order.orderStatus,
@@ -189,6 +261,17 @@ const createOrder = async (req, res, next) => {
     if (session) {
       session.endSession();
     }
+    // Standalone MongoDB cannot use multi-document transactions. Compensate any
+    // completed stock deductions and remove partial order records on failure.
+    if (!useTransaction && createdOrderId) {
+      await Promise.all(deductedItems.map((item) => Product.findByIdAndUpdate(
+        item.product._id,
+        { $inc: { stock: item.quantity } }
+      )));
+      await OrderItem.deleteMany({ orderId: createdOrderId });
+      await Order.findByIdAndDelete(createdOrderId);
+    }
+    if (!useTransaction && couponReserved) await Coupon.findOneAndUpdate({ code: couponCode, usedCount: { $gt: 0 } }, { $inc: { usedCount: -1 } });
     next(err);
   }
 };
@@ -208,6 +291,11 @@ const getMyOrders = async (req, res, next) => {
           _id: order._id,
           userId: order.userId,
           totalAmount: order.totalAmount,
+          originalAmount: order.originalAmount || order.totalAmount,
+          couponCode: order.couponCode,
+          couponDiscount: order.couponDiscount,
+          referralDiscount: order.referralDiscount,
+          deliveredAt: order.deliveredAt,
           shippingAddress: order.shippingAddress,
           phone: order.phone,
           orderStatus: order.orderStatus,
@@ -260,6 +348,11 @@ const getOrderById = async (req, res, next) => {
         _id: order._id,
         userId: order.userId,
         totalAmount: order.totalAmount,
+        originalAmount: order.originalAmount || order.totalAmount,
+        couponCode: order.couponCode,
+        couponDiscount: order.couponDiscount,
+        referralDiscount: order.referralDiscount,
+        deliveredAt: order.deliveredAt,
         shippingAddress: order.shippingAddress,
         phone: order.phone,
         orderStatus: order.orderStatus,
